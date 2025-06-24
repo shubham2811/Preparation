@@ -1,4 +1,4 @@
-1. **React Batch update** 
+# React Batch update
 ```js
 export default function App() {
   const [count, setCount] = useState(0);
@@ -27,3 +27,20 @@ Both setCount(5) and setCount(2) are called in the same event handler. React bat
 setCount(c => c + 5);
 setCount(c => c + 2);
 ```
+
+
+
+# Different ways of calling a function
+
+```js
+onClick={handleClick}
+onClick={handleClick()}
+onClick={()=>handleClick}
+onClick={()=>handleClick()}
+```
+| Syntax                        | When is function called?         | Typical Use Case                          |
+|-------------------------------|----------------------------------|-------------------------------------------|
+| `onClick={handleClick}`        | On click                         | Simple handlers                           |
+| `onClick={handleClick()}`      | On render                        | Not recommended                           |
+| `onClick={() => handleClick}`  | Never (returns function ref)     | Rarely used                               |
+| `onClick={() => handleClick()}`| On click                         | When passing arguments or logic           |
