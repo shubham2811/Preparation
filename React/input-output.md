@@ -1,4 +1,4 @@
-1. 
+1. **React Batch update** 
 ```js
 export default function App() {
   const [count, setCount] = useState(0);
