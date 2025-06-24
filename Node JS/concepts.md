@@ -170,3 +170,37 @@ wss.on('connection', ws => {
 </body>
 </html>
 ```
+# Multithreading and clustering in node js
+
+## Multithreading
+```js
+const { Worker } = require('worker_threads');
+
+new Worker('./heavy-task.js'); // runs in parallel thread
+
+```
+## Clustering
+```js
+const cluster = require('cluster');
+const http = require('http');
+const os = require('os');
+
+if (cluster.isMaster) {
+  const numCPUs = os.cpus().length;
+  for (let i = 0; i < numCPUs; i++) cluster.fork();
+} else {
+  http.createServer((req, res) => res.end('Handled by worker')).listen(3000);
+}
+
+```
+
+### Summary
+| Feature         | Multithreading (`worker_threads`) | Clustering (`cluster`)           |
+| --------------- | --------------------------------- | -------------------------------- |
+| Execution model | Threads in same process           | Separate processes               |
+| Memory sharing  | Possible                          | Not shared                       |
+| Use case        | CPU-bound tasks                   | Scaling web servers              |
+| Communication   | Message passing (fast)            | IPC (slower)                     |
+| Overhead        | Lower                             | Higher                           |
+| Port sharing    | No                                | Yes (can share HTTP server port) |
+
