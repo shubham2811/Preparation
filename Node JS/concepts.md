@@ -845,7 +845,7 @@ if (cluster.isMaster) {
     });
   });
   
-  cluster.on('exit', (worker, code, signal) => {
+  cluster.on('exit', (worker, code) => {
     console.log(`Worker ${worker.process.pid} died`);
     workerHealth.delete(worker.id);
     
@@ -1827,378 +1827,1287 @@ Understanding these phases helps you write more efficient Node.js applications a
 
 ---
 
-# Service Discovery in Microservices
+# Memory Leaks in Node.js: Identification and Prevention
 
-## What is Service Discovery?
+## Overview
 
-Service Discovery is a mechanism that allows microservices to find and communicate with each other without hardcoding network locations. In a microservices architecture, services are distributed across multiple hosts and can dynamically scale up/down, making static configuration impractical.
+Memory leaks in Node.js occur when the application retains references to objects that are no longer needed, preventing garbage collection. This leads to increasing memory usage and eventual application crashes.
 
-## Why Service Discovery is Needed
-
-### Problems Without Service Discovery:
-1. **Dynamic IP Addresses**: Containers get new IPs when restarted
-2. **Auto-scaling**: Services can spin up/down automatically
-3. **Load Balancing**: Need to distribute requests across multiple instances
-4. **Failure Handling**: Services may become unavailable and recover
-5. **Environment Differences**: Different configurations for dev/staging/prod
-
-## Types of Service Discovery
-
-| Type | Description | Examples | Pros | Cons |
-|------|-------------|----------|------|------|
-| **Client-Side** | Client directly queries service registry | Eureka, Consul | Simple, no proxy overhead | Client complexity, language-specific |
-| **Server-Side** | Load balancer queries service registry | AWS ALB, Nginx Plus | Language agnostic, centralized | Single point of failure, latency |
-| **Service Mesh** | Infrastructure layer handles discovery | Istio, Linkerd | Advanced features, observability | Complex setup, overhead |
+| Detection Method | Purpose | Tools | Complexity |
+|------------------|---------|--------|------------|
+| **Process Monitoring** | Track memory usage over time | `process.memoryUsage()`, htop | Low |
+| **Heap Snapshots** | Compare memory states | Chrome DevTools, heapdump | Medium |
+| **Profiling** | Real-time memory analysis | clinic.js, 0x | High |
+| **APM Tools** | Production monitoring | New Relic, DataDog | Medium |
 
 ---
 
-## 1. Client-Side Service Discovery
+## 1. Identifying Memory Leaks
 
-The client is responsible for determining network locations and load balancing.
-
-### Using Consul for Service Discovery
-
+### Basic Memory Monitoring
 ```js
-// consul-client.js
-const consul = require('consul')({ host: 'localhost', port: 8500 });
-
-class ServiceDiscovery {
-  constructor() {
-    this.consul = consul;
-    this.services = new Map();
-  }
-
-  // Register a service
-  async registerService(serviceName, serviceId, port, health) {
-    const serviceConfig = {
-      id: serviceId,
-      name: serviceName,
-      address: 'localhost',
-      port: port,
-      check: {
-        http: `http://localhost:${port}${health}`,
-        interval: '10s',
-        timeout: '3s'
-      }
-    };
-
-    try {
-      await this.consul.agent.service.register(serviceConfig);
-      console.log(`Service ${serviceName} registered with ID: ${serviceId}`);
-    } catch (error) {
-      console.error('Service registration failed:', error);
-    }
-  }
-
-  // Discover services
-  async discoverService(serviceName) {
-    try {
-      const services = await this.consul.health.service({
-        service: serviceName,
-        passing: true // Only healthy services
-      });
-
-      const instances = services[1].map(service => ({
-        id: service.Service.ID,
-        address: service.Service.Address,
-        port: service.Service.Port,
-        health: service.Checks.every(check => check.Status === 'passing')
-      }));
-
-      this.services.set(serviceName, instances);
-      return instances;
-    } catch (error) {
-      console.error('Service discovery failed:', error);
-      return [];
-    }
-  }
-
-  // Get service instance with load balancing
-  getServiceInstance(serviceName) {
-    const instances = this.services.get(serviceName) || [];
-    if (instances.length === 0) return null;
-
-    // Simple round-robin load balancing
-    const index = Math.floor(Math.random() * instances.length);
-    return instances[index];
-  }
-
-  // Deregister service
-  async deregisterService(serviceId) {
-    try {
-      await this.consul.agent.service.deregister(serviceId);
-      console.log(`Service ${serviceId} deregistered`);
-    } catch (error) {
-      console.error('Service deregistration failed:', error);
-    }
-  }
-}
-
-module.exports = ServiceDiscovery;
-```
-
-### User Service Example
-
-```js
-// user-service.js
-const express = require('express');
-const axios = require('axios');
-const ServiceDiscovery = require('./consul-client');
-
-const app = express();
-const PORT = process.env.PORT || 3001;
-const SERVICE_ID = `user-service-${PORT}`;
-
-const discovery = new ServiceDiscovery();
-
-app.use(express.json());
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy', service: 'user-service' });
-});
-
-// User endpoints
-app.get('/users', (req, res) => {
-  res.json([
-    { id: 1, name: 'John Doe', email: 'john@example.com' },
-    { id: 2, name: 'Jane Smith', email: 'jane@example.com' }
-  ]);
-});
-
-app.get('/users/:id', (req, res) => {
-  const userId = parseInt(req.params.id);
-  const user = { id: userId, name: `User ${userId}`, email: `user${userId}@example.com` };
-  res.json(user);
-});
-
-// Call another service
-app.get('/users/:id/orders', async (req, res) => {
-  try {
-    // Discover order service
-    const orderInstances = await discovery.discoverService('order-service');
-    const orderInstance = discovery.getServiceInstance('order-service');
-    
-    if (!orderInstance) {
-      return res.status(503).json({ error: 'Order service unavailable' });
-    }
-
-    const response = await axios.get(
-      `http://${orderInstance.address}:${orderInstance.port}/orders/user/${req.params.id}`
-    );
-
-    res.json(response.data);
-  } catch (error) {
-    console.error('Error calling order service:', error.message);
-    res.status(500).json({ error: 'Failed to fetch user orders' });
-  }
-});
-
-// Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down user service...');
-  await discovery.deregisterService(SERVICE_ID);
-  process.exit(0);
-});
-
-app.listen(PORT, async () => {
-  console.log(`User service running on port ${PORT}`);
+// Monitor memory usage programmatically
+const monitorMemory = () => {
+  const usage = process.memoryUsage();
   
-  // Register service with Consul
-  await discovery.registerService('user-service', SERVICE_ID, PORT, '/health');
-  
-  // Start service discovery for dependencies
-  setInterval(async () => {
-    await discovery.discoverService('order-service');
-  }, 30000); // Update every 30 seconds
-});
-```
-
-### Order Service Example
-
-```js
-// order-service.js
-const express = require('express');
-const ServiceDiscovery = require('./consul-client');
-
-const app = express();
-const PORT = process.env.PORT || 3002;
-const SERVICE_ID = `order-service-${PORT}`;
-
-const discovery = new ServiceDiscovery();
-
-app.use(express.json());
-
-// Mock orders data
-const orders = {
-  1: [
-    { id: 101, userId: 1, product: 'Laptop', amount: 999.99 },
-    { id: 102, userId: 1, product: 'Mouse', amount: 29.99 }
-  ],
-  2: [
-    { id: 103, userId: 2, product: 'Keyboard', amount: 79.99 }
-  ]
-};
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'healthy', service: 'order-service' });
-});
-
-app.get('/orders/user/:userId', (req, res) => {
-  const userId = parseInt(req.params.userId);
-  const userOrders = orders[userId] || [];
-  res.json(userOrders);
-});
-
-app.get('/orders/:id', (req, res) => {
-  const orderId = parseInt(req.params.id);
-  // Find order across all users
-  for (const userId in orders) {
-    const order = orders[userId].find(o => o.id === orderId);
-    if (order) {
-      return res.json(order);
-    }
-  }
-  res.status(404).json({ error: 'Order not found' });
-});
-
-process.on('SIGINT', async () => {
-  console.log('Shutting down order service...');
-  await discovery.deregisterService(SERVICE_ID);
-  process.exit(0);
-});
-
-app.listen(PORT, async () => {
-  console.log(`Order service running on port ${PORT}`);
-  await discovery.registerService('order-service', SERVICE_ID, PORT, '/health');
-});
-```
-
----
-
-## 2. Server-Side Service Discovery
-
-Load balancer handles service discovery and routing.
-
-### Using NGINX with Consul Template
-
-```nginx
-# nginx.conf.template
-upstream user-service {
-  {{range service "user-service"}}
-  server {{.Address}}:{{.Port}};
-  {{end}}
-}
-
-upstream order-service {
-  {{range service "order-service"}}
-  server {{.Address}}:{{.Port}};
-  {{end}}
-}
-
-server {
-  listen 80;
-  
-  location /api/users {
-    proxy_pass http://user-service;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }
-  
-  location /api/orders {
-    proxy_pass http://order-service;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-  }
-}
-```
-
-### API Gateway with Service Discovery
-
-```js
-// api-gateway.js
-const express = require('express');
-const httpProxy = require('http-proxy-middleware');
-const ServiceDiscovery = require('./consul-client');
-
-const app = express();
-const PORT = 3000;
-const discovery = new ServiceDiscovery();
-
-// Service routing configuration
-const serviceRoutes = {
-  '/api/users': 'user-service',
-  '/api/orders': 'order-service',
-  '/api/products': 'product-service'
-};
-
-// Dynamic proxy middleware
-const createProxyMiddleware = (serviceName) => {
-  return httpProxy({
-    target: 'http://localhost', // Will be overridden
-    changeOrigin: true,
-    router: async (req) => {
-      // Discover service instance
-      const instances = await discovery.discoverService(serviceName);
-      const instance = discovery.getServiceInstance(serviceName);
-      
-      if (!instance) {
-        throw new Error(`Service ${serviceName} not available`);
-      }
-      
-      return `http://${instance.address}:${instance.port}`;
-    },
-    onError: (err, req, res) => {
-      console.error(`Proxy error for ${serviceName}:`, err.message);
-      res.status(503).json({ error: 'Service unavailable' });
-    },
-    pathRewrite: {
-      '^/api': '' // Remove /api prefix when forwarding
-    }
+  console.log({
+    rss: `${Math.round(usage.rss / 1024 / 1024)} MB`,      // Resident Set Size
+    heapUsed: `${Math.round(usage.heapUsed / 1024 / 1024)} MB`,
+    heapTotal: `${Math.round(usage.heapTotal / 1024 / 1024)} MB`,
+    external: `${Math.round(usage.external / 1024 / 1024)} MB`,
+    arrayBuffers: `${Math.round(usage.arrayBuffers / 1024 / 1024)} MB`
   });
 };
 
-// Register routes with service discovery
-Object.entries(serviceRoutes).forEach(([route, serviceName]) => {
-  app.use(route, createProxyMiddleware(serviceName));
-});
+// Monitor every 5 seconds
+setInterval(monitorMemory, 5000);
 
-// Health check
-app.get('/health', (req, res) => {
-  res.json({ status: 'healthy', service: 'api-gateway' });
+// Monitor on specific events
+process.on('SIGTERM', () => {
+  console.log('Final memory usage:');
+  monitorMemory();
 });
+```
 
-// Service discovery monitoring
-setInterval(async () => {
-  for (const serviceName of Object.values(serviceRoutes)) {
-    await discovery.discoverService(serviceName);
+### Advanced Memory Tracking
+```js
+const v8 = require('v8');
+
+class MemoryTracker {
+  constructor() {
+    this.baseline = null;
+    this.samples = [];
   }
-}, 10000); // Update every 10 seconds
+  
+  setBaseline() {
+    this.baseline = process.memoryUsage();
+    console.log('Memory baseline set:', this.baseline);
+  }
+  
+  sample(label = 'sample') {
+    const current = process.memoryUsage();
+    const heapStats = v8.getHeapStatistics();
+    
+    const sample = {
+      timestamp: Date.now(),
+      label,
+      memory: current,
+      heap: heapStats,
+      growth: this.baseline ? {
+        rss: current.rss - this.baseline.rss,
+        heapUsed: current.heapUsed - this.baseline.heapUsed
+      } : null
+    };
+    
+    this.samples.push(sample);
+    console.log(`Memory sample [${label}]:`, {
+      heapUsed: `${Math.round(current.heapUsed / 1024 / 1024)} MB`,
+      growth: sample.growth ? `+${Math.round(sample.growth.heapUsed / 1024 / 1024)} MB` : 'N/A'
+    });
+    
+    return sample;
+  }
+  
+  analyze() {
+    if (this.samples.length < 2) return;
+    
+    const first = this.samples[0];
+    const last = this.samples[this.samples.length - 1];
+    const totalGrowth = last.memory.heapUsed - first.memory.heapUsed;
+    const timeSpan = last.timestamp - first.timestamp;
+    
+    console.log('Memory Analysis:', {
+      samples: this.samples.length,
+      timeSpan: `${timeSpan / 1000}s`,
+      totalGrowth: `${Math.round(totalGrowth / 1024 / 1024)} MB`,
+      growthRate: `${Math.round(totalGrowth / timeSpan * 1000)} bytes/second`
+    });
+    
+    // Detect potential leak
+    if (totalGrowth > 50 * 1024 * 1024) { // 50MB
+      console.warn('⚠️  Potential memory leak detected!');
+    }
+  }
+}
 
-app.listen(PORT, () => {
-  console.log(`API Gateway running on port ${PORT}`);
+// Usage
+const tracker = new MemoryTracker();
+tracker.setBaseline();
+
+// Sample at different points
+tracker.sample('app-start');
+// ... your app code ...
+tracker.sample('after-processing');
+tracker.analyze();
+```
+
+### Heap Snapshot Creation
+```js
+const v8 = require('v8');
+const fs = require('fs');
+
+// Create heap snapshot
+const createHeapSnapshot = (filename) => {
+  const snapshotStream = v8.getHeapSnapshot();
+  const fileStream = fs.createWriteStream(filename);
+  
+  snapshotStream.pipe(fileStream);
+  console.log(`Heap snapshot saved to ${filename}`);
+};
+
+// Usage
+createHeapSnapshot(`heap-${Date.now()}.heapsnapshot`);
+
+// Automated snapshot on high memory usage
+const autoSnapshot = () => {
+  const usage = process.memoryUsage();
+  const heapUsedMB = usage.heapUsed / 1024 / 1024;
+  
+  if (heapUsedMB > 100) { // 100MB threshold
+    createHeapSnapshot(`auto-heap-${Date.now()}.heapsnapshot`);
+  }
+};
+
+setInterval(autoSnapshot, 30000); // Check every 30 seconds
+```
+
+---
+
+## 2. Common Memory Leak Causes
+
+### Event Listener Leaks
+```js
+// ❌ MEMORY LEAK: Event listeners not removed
+class LeakyEventEmitter {
+  constructor() {
+    this.eventEmitter = new EventEmitter();
+    this.users = [];
+  }
+  
+  addUser(user) {
+    this.users.push(user);
+    
+    // This creates a new listener for each user
+    this.eventEmitter.on('userUpdate', (data) => {
+      console.log(`User ${user.id} updated:`, data);
+    });
+  }
+  
+  removeUser(userId) {
+    this.users = this.users.filter(u => u.id !== userId);
+    // ❌ Listener not removed - MEMORY LEAK!
+  }
+}
+
+// ✅ FIXED: Proper listener management
+class FixedEventEmitter {
+  constructor() {
+    this.eventEmitter = new EventEmitter();
+    this.users = new Map();
+    this.listeners = new Map();
+  }
+  
+  addUser(user) {
+    this.users.set(user.id, user);
+    
+    // Store reference to listener function
+    const listener = (data) => {
+      console.log(`User ${user.id} updated:`, data);
+    };
+    
+    this.listeners.set(user.id, listener);
+    this.eventEmitter.on('userUpdate', listener);
+  }
+  
+  removeUser(userId) {
+    this.users.delete(userId);
+    
+    // ✅ Remove the specific listener
+    const listener = this.listeners.get(userId);
+    if (listener) {
+      this.eventEmitter.removeListener('userUpdate', listener);
+      this.listeners.delete(userId);
+    }
+  }
+  
+  cleanup() {
+    // ✅ Remove all listeners
+    this.eventEmitter.removeAllListeners();
+    this.users.clear();
+    this.listeners.clear();
+  }
+}
+```
+
+### Closure Memory Leaks
+```js
+// ❌ MEMORY LEAK: Closure retains large objects
+const createHandler = (largeData) => {
+  const data = largeData; // Large object retained in closure
+  
+  return {
+    process: () => {
+      // Only uses a small part of data
+      console.log(data.summary);
+    },
+    data: data // ❌ Entire object exposed
+  };
+};
+
+// ✅ FIXED: Extract only needed data
+const createHandler = (largeData) => {
+  const summary = largeData.summary; // Extract only what's needed
+  
+  return {
+    process: () => {
+      console.log(summary);
+    }
+    // ✅ Large object not retained
+  };
+};
+
+// ❌ MEMORY LEAK: Timer in closure
+const setupTimer = (userData) => {
+  return setInterval(() => {
+    // Even if this timer is never cleared,
+    // userData remains in memory
+    if (userData.isActive) {
+      processUser(userData);
+    }
+  }, 1000);
+};
+
+// ✅ FIXED: Weak references and cleanup
+const timers = new Set();
+
+const setupTimer = (userData) => {
+  const timerId = setInterval(() => {
+    if (userData.isActive) {
+      processUser(userData);
+    } else {
+      // ✅ Self-cleanup when inactive
+      clearInterval(timerId);
+      timers.delete(timerId);
+    }
+  }, 1000);
+  
+  timers.add(timerId);
+  return timerId;
+};
+
+// Cleanup function
+const cleanup = () => {
+  timers.forEach(timerId => clearInterval(timerId));
+  timers.clear();
+};
+
+process.on('SIGTERM', cleanup);
+```
+
+### Global Variable Accumulation
+```js
+// ❌ MEMORY LEAK: Growing global cache
+global.userCache = {};
+global.sessionData = {};
+
+const addUser = (user) => {
+  global.userCache[user.id] = user; // ❌ Never cleaned up
+};
+
+// ✅ FIXED: Bounded cache with TTL
+class BoundedCache {
+  constructor(maxSize = 1000, ttl = 5 * 60 * 1000) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.ttl = ttl;
+    
+    // Cleanup expired entries every minute
+    setInterval(() => this.cleanup(), 60000);
+  }
+  
+  set(key, value) {
+    // Remove oldest entries if at max size
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    
+    // Check if expired
+    if (Date.now() - item.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return item.value;
+  }
+  
+  cleanup() {
+    const now = Date.now();
+    for (const [key, item] of this.cache) {
+      if (now - item.timestamp > this.ttl) {
+        this.cache.delete(key);
+      }
+    }
+  }
+}
+
+const userCache = new BoundedCache(1000, 5 * 60 * 1000);
+```
+
+### Stream and Buffer Leaks
+```js
+const fs = require('fs');
+
+// ❌ MEMORY LEAK: Stream not properly closed
+const processFile = (filename) => {
+  const stream = fs.createReadStream(filename);
+  
+  stream.on('data', (chunk) => {
+    // Process chunk
+  });
+  
+  // ❌ No error handling or cleanup
+};
+
+// ✅ FIXED: Proper stream management
+const processFile = (filename) => {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filename);
+    const chunks = [];
+    
+    stream.on('data', (chunk) => {
+      chunks.push(chunk);
+    });
+    
+    stream.on('end', () => {
+      resolve(Buffer.concat(chunks));
+    });
+    
+    stream.on('error', (error) => {
+      stream.destroy(); // ✅ Cleanup on error
+      reject(error);
+    });
+    
+    // ✅ Timeout protection
+    const timeout = setTimeout(() => {
+      stream.destroy();
+      reject(new Error('Stream timeout'));
+    }, 30000);
+    
+    stream.on('close', () => {
+      clearTimeout(timeout);
+    });
+  });
+};
+
+// ✅ Buffer pool for reuse
+class BufferPool {
+  constructor(bufferSize = 64 * 1024) {
+    this.buffers = [];
+    this.bufferSize = bufferSize;
+  }
+  
+  acquire() {
+    return this.buffers.pop() || Buffer.allocUnsafe(this.bufferSize);
+  }
+  
+  release(buffer) {
+    if (buffer.length === this.bufferSize) {
+      buffer.fill(0); // Clear data
+      this.buffers.push(buffer);
+    }
+  }
+}
+
+const bufferPool = new BufferPool();
+```
+
+---
+
+## 3. Debugging Tools and Techniques
+
+### Using Chrome DevTools
+```bash
+# Start Node.js with inspector
+node --inspect=0.0.0.0:9229 app.js
+
+# Or break on start
+node --inspect-brk=0.0.0.0:9229 app.js
+
+# Then open Chrome and go to chrome://inspect
+```
+
+### Using clinic.js for Performance Analysis
+```bash
+# Install clinic.js
+npm install -g clinic
+
+# Doctor - detects event loop issues
+clinic doctor -- node app.js
+
+# Bubbleprof - async operations profiling
+clinic bubbleprof -- node app.js
+
+# Flame - CPU profiling
+clinic flame -- node app.js
+
+# Heap profiler
+clinic heapprofiler -- node app.js
+```
+
+### Memory Leak Detection Script
+```js
+// memory-monitor.js
+const fs = require('fs');
+
+class MemoryLeakDetector {
+  constructor(options = {}) {
+    this.threshold = options.threshold || 50; // MB
+    this.interval = options.interval || 5000; // 5 seconds
+    this.samples = [];
+    this.maxSamples = options.maxSamples || 100;
+    this.isMonitoring = false;
+  }
+  
+  start() {
+    if (this.isMonitoring) return;
+    
+    this.isMonitoring = true;
+    console.log('🔍 Starting memory leak detection...');
+    
+    this.intervalId = setInterval(() => {
+      this.takeSample();
+    }, this.interval);
+  }
+  
+  stop() {
+    if (!this.isMonitoring) return;
+    
+    clearInterval(this.intervalId);
+    this.isMonitoring = false;
+    console.log('⏹️  Memory monitoring stopped');
+  }
+  
+  takeSample() {
+    const usage = process.memoryUsage();
+    const timestamp = Date.now();
+    
+    this.samples.push({ timestamp, ...usage });
+    
+    // Keep only recent samples
+    const oneHourAgo = timestamp - 60 * 60 * 1000;
+    this.samples = this.samples.filter(s => s.timestamp > oneHourAgo);
+    
+    this.checkThresholds(usage);
+    this.checkGrowthRate();
+  }
+  
+  checkThresholds(usage) {
+    if (usage.heapUsed > this.threshold * 1024 * 1024) {
+      this.sendAlert('HIGH_HEAP_USAGE', {
+        current: Math.round(usage.heapUsed / 1024 / 1024),
+        threshold: Math.round(this.threshold)
+      });
+    }
+  }
+  
+  checkGrowthRate() {
+    if (this.samples.length < 2) return;
+    
+    const recent = this.samples.slice(-2);
+    const oldest = recent[0];
+    const newest = recent[1];
+    
+    const growth = newest.heapUsed - oldest.heapUsed;
+    const timeSpan = newest.timestamp - oldest.timestamp;
+    const growthPerMinute = (growth / timeSpan) * 60 * 1000;
+    
+    if (growthPerMinute > this.threshold * 1024 * 1024) {
+      this.sendAlert('HIGH_GROWTH_RATE', {
+        rate: Math.round(growthPerMinute / 1024 / 1024),
+        threshold: Math.round(this.threshold)
+      });
+    }
+  }
+  
+  sendAlert(type, data) {
+    console.error(`🚨 MEMORY ALERT [${type}]:`, data);
+    
+    // In production, integrate with your alerting system
+    // this.notificationService.send(type, data);
+  }
+}
+
+// Start monitoring in production
+if (process.env.NODE_ENV === 'production') {
+  const monitor = new ProductionMemoryMonitor();
+  monitor.start();
+}
+```
+
+---
+
+## 4. Prevention Best Practices
+
+### Memory-Safe Patterns
+```js
+// ✅ Use WeakMap for object associations
+const objectMetadata = new WeakMap();
+
+class DataProcessor {
+  setMetadata(obj, metadata) {
+    objectMetadata.set(obj, metadata);
+    // When obj is garbage collected, metadata is automatically removed
+  }
+  
+  getMetadata(obj) {
+    return objectMetadata.get(obj);
+  }
+}
+
+// ✅ Implement proper cleanup interfaces
+class ResourceManager {
+  constructor() {
+    this.resources = new Set();
+    this.cleanupCallbacks = new Set();
+  }
+  
+  addResource(resource) {
+    this.resources.add(resource);
+    
+    // Add cleanup callback if resource supports it
+    if (typeof resource.cleanup === 'function') {
+      this.cleanupCallbacks.add(() => resource.cleanup());
+    }
+  }
+  
+  removeResource(resource) {
+    this.resources.delete(resource);
+    
+    // Cleanup immediately
+    if (typeof resource.cleanup === 'function') {
+      resource.cleanup();
+    }
+  }
+  
+  cleanup() {
+    // Run all cleanup callbacks
+    this.cleanupCallbacks.forEach(callback => {
+      try {
+        callback();
+      } catch (error) {
+        console.error('Cleanup error:', error);
+      }
+    });
+    
+    this.resources.clear();
+    this.cleanupCallbacks.clear();
+  }
+}
+```
+
+### Production Monitoring Setup
+```js
+// production-monitor.js
+const os = require('os');
+
+class ProductionMemoryMonitor {
+  constructor() {
+    this.alertThresholds = {
+      heapUsed: 1024 * 1024 * 1024, // 1GB
+      rss: 2 * 1024 * 1024 * 1024,  // 2GB
+      growthRate: 10 * 1024 * 1024   // 10MB/minute
+    };
+    
+    this.samples = [];
+    this.alertsSent = new Set();
+  }
+  
+  start() {
+    // Monitor every minute in production
+    setInterval(() => {
+      this.checkMemory();
+    }, 60000);
+    
+    // Initial check
+    this.checkMemory();
+  }
+  
+  checkMemory() {
+    const usage = process.memoryUsage();
+    const timestamp = Date.now();
+    
+    this.samples.push({ timestamp, ...usage });
+    
+    // Keep only last hour of samples
+    const oneHourAgo = timestamp - 60 * 60 * 1000;
+    this.samples = this.samples.filter(s => s.timestamp > oneHourAgo);
+    
+    this.checkThresholds(usage);
+    this.checkGrowthRate();
+  }
+  
+  checkThresholds(usage) {
+    if (usage.heapUsed > this.alertThresholds.heapUsed) {
+      this.sendAlert('HIGH_HEAP_USAGE', {
+        current: Math.round(usage.heapUsed / 1024 / 1024),
+        threshold: Math.round(this.alertThresholds.heapUsed / 1024 / 1024)
+      });
+    }
+    
+    if (usage.rss > this.alertThresholds.rss) {
+      this.sendAlert('HIGH_RSS_USAGE', {
+        current: Math.round(usage.rss / 1024 / 1024),
+        threshold: Math.round(this.alertThresholds.rss / 1024 / 1024)
+      });
+    }
+  }
+  
+  checkGrowthRate() {
+    if (this.samples.length < 10) return;
+    
+    const recent = this.samples.slice(-10);
+    const oldest = recent[0];
+    const newest = recent[recent.length - 1];
+    
+    const growth = newest.heapUsed - oldest.heapUsed;
+    const timeSpan = newest.timestamp - oldest.timestamp;
+    const growthPerMinute = (growth / timeSpan) * 60 * 1000;
+    
+    if (growthPerMinute > this.alertThresholds.growthRate) {
+      this.sendAlert('HIGH_GROWTH_RATE', {
+        rate: Math.round(growthPerMinute / 1024 / 1024),
+        threshold: Math.round(this.alertThresholds.growthRate / 1024 / 1024)
+      });
+    }
+  }
+  
+  sendAlert(type, data) {
+    const alertKey = `${type}_${Math.floor(Date.now() / 300000)}`; // 5min window
+    
+    if (this.alertsSent.has(alertKey)) return;
+    
+    this.alertsSent.add(alertKey);
+    
+    // Send to monitoring service (e.g., Slack, PagerDuty, etc.)
+    console.error(`🚨 MEMORY ALERT [${type}]:`, data);
+    
+    // In production, integrate with your alerting system
+    // this.notificationService.send(type, data);
+  }
+}
+
+// Start monitoring in production
+if (process.env.NODE_ENV === 'production') {
+  const monitor = new ProductionMemoryMonitor();
+  monitor.start();
+}
+```
+
+---
+
+## 5. Memory Leak Checklist
+
+### Development Checklist
+- [ ] Remove event listeners when components are destroyed
+- [ ] Clear timers and intervals
+- [ ] Close streams and database connections
+- [ ] Use WeakMap/WeakSet for temporary object associations
+- [ ] Implement cleanup methods in classes
+- [ ] Avoid global variables for temporary data
+- [ ] Use bounded caches with TTL
+- [ ] Handle promise rejections properly
+
+### Testing Checklist
+- [ ] Run memory profiling during load tests
+- [ ] Monitor memory growth over extended periods
+- [ ] Test cleanup functionality
+- [ ] Verify event listener removal
+- [ ] Check for orphaned timers
+- [ ] Test error scenarios for proper cleanup
+
+### Production Checklist
+- [ ] Set up memory monitoring alerts
+- [ ] Configure heap dump generation on high usage
+- [ ] Implement graceful shutdown procedures
+- [ ] Monitor garbage collection frequency
+- [ ] Set up automatic restarts for memory thresholds
+- [ ] Log memory statistics periodically
+
+---
+
+## Tools Summary
+
+| Tool | Purpose | Best For | Cost |
+|------|---------|----------|------|
+| **Chrome DevTools** | Heap analysis, snapshots | Development debugging | Free |
+| **clinic.js** | Performance profiling | Development optimization | Free |
+| **heapdump** | Heap snapshot generation | Production debugging | Free |
+| **memwatch-next** | Real-time memory monitoring | Development/Testing | Free |
+| **New Relic** | APM with memory tracking | Production monitoring | Paid |
+| **DataDog** | Infrastructure monitoring | Production monitoring | Paid |
+
+Understanding and preventing memory leaks is crucial for building robust Node.js applications that can handle production loads efficiently.
+
+# Session-Based vs Token-Based Authentication: Detailed Comparison
+
+## Architecture Differences
+
+### Session-Based Authentication Flow
+```
+1. User submits credentials
+2. Server validates credentials
+3. Server creates session in memory/database
+4. Server sends session ID as cookie
+5. Client automatically sends cookie with requests
+6. Server validates session ID and retrieves user data
+```
+
+### Token-Based Authentication Flow
+```
+1. User submits credentials
+2. Server validates credentials
+3. Server creates signed JWT token
+4. Server sends token to client
+5. Client stores token and sends in Authorization header
+6. Server validates token signature and extracts user data
+```
+
+---
+
+## Detailed Comparison Table
+
+| Aspect | Session-Based | Token-Based (JWT) |
+|--------|---------------|-------------------|
+| **State Management** | Stateful (server stores session) | Stateless (token contains all data) |
+| **Scalability** | Difficult (session sharing needed) | Easy (no server state) |
+| **Memory Usage** | High (server stores all sessions) | Low (no server storage) |
+| **Network Overhead** | Low (small session ID) | Medium (larger token size) |
+| **Security Storage** | Server-side (more secure) | Client-side (less secure) |
+| **CSRF Protection** | Vulnerable (automatic cookie sending) | Protected (manual token sending) |
+| **XSS Protection** | Better (HTTP-only cookies) | Vulnerable (localStorage accessible) |
+| **Token Expiration** | Server controls | Built into token |
+| **Logout** | Server destroys session | Client discards token |
+| **Cross-Domain** | Limited (same-origin cookies) | Easy (CORS headers) |
+| **Mobile Apps** | Complex cookie handling | Simple header-based |
+| **Microservices** | Requires shared session store | Self-contained validation |
+
+---
+
+## Code Examples Comparison
+
+### Session-Based Implementation
+```js
+const express = require('express');
+const session = require('express-session');
+const MongoStore = require('connect-mongo');
+
+const app = express();
+
+// Session configuration
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  store: MongoStore.create({
+    mongoUrl: 'mongodb://localhost/sessions'
+  }),
+  cookie: {
+    secure: process.env.NODE_ENV === 'production',
+    httpOnly: true, // Prevent XSS
+    maxAge: 24 * 60 * 60 * 1000 // 24 hours
+  }
+}));
+
+// Login endpoint
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    const user = await User.findOne({ username });
+    if (user && await bcrypt.compare(password, user.password)) {
+      // Store user data in session
+      req.session.userId = user._id;
+      req.session.username = user.username;
+      req.session.role = user.role;
+      
+      res.json({ 
+        success: true, 
+        message: 'Login successful',
+        user: { id: user._id, username: user.username }
+      });
+    } else {
+      res.status(401).json({ message: 'Invalid credentials' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Authentication middleware
+const requireAuth = (req, res, next) => {
+  if (req.session && req.session.userId) {
+    // Session exists, user is authenticated
+    req.user = {
+      id: req.session.userId,
+      username: req.session.username,
+      role: req.session.role
+    };
+    next();
+  } else {
+    res.status(401).json({ message: 'Authentication required' });
+  }
+};
+
+// Protected route
+app.get('/api/profile', requireAuth, (req, res) => {
+  res.json({ 
+    message: 'Profile data',
+    user: req.user 
+  });
+});
+
+// Logout
+app.post('/api/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({ message: 'Logout failed' });
+    }
+    res.clearCookie('connect.sid'); // Clear session cookie
+    res.json({ message: 'Logout successful' });
+  });
+});
+```
+
+### Token-Based (JWT) Implementation
+```js
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+
+const JWT_SECRET = process.env.JWT_SECRET;
+const JWT_EXPIRES_IN = '24h';
+
+// Login endpoint
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    const user = await User.findOne({ username });
+    if (user && await bcrypt.compare(password, user.password)) {
+      // Create JWT token with user data
+      const token = jwt.sign(
+        { 
+          userId: user._id,
+          username: user.username,
+          role: user.role,
+          iat: Math.floor(Date.now() / 1000) // Issued at
+        },
+        JWT_SECRET,
+        { expiresIn: JWT_EXPIRES_IN }
+      );
+      
+      res.json({ 
+        success: true,
+        message: 'Login successful',
+        token,
+        user: { id: user._id, username: user.username }
+      });
+    } else {
+      res.status(401).json({ message: 'Invalid credentials' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// JWT Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+  
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+  
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ message: 'Invalid or expired token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Protected route with JWT
+app.get('/api/auth/profile', authenticateToken, (req, res) => {
+  res.json({ 
+    message: 'Profile data',
+    user: req.user 
+  });
+});
+
+// Token refresh
+app.post('/api/auth/refresh', authenticateToken, (req, res) => {
+  // Generate new token with extended expiry
+  const newToken = jwt.sign(
+    { 
+      userId: req.user.userId,
+      username: req.user.username,
+      role: req.user.role 
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+  
+  res.json({ 
+    message: 'Token refreshed',
+    token: newToken 
+  });
+});
+
+// Logout (client-side token removal)
+app.post('/api/auth/logout', authenticateToken, (req, res) => {
+  // With JWT, logout is handled client-side by removing the token
+  // Server can optionally maintain a blacklist of revoked tokens
+  res.json({ 
+    message: 'Logout successful. Remove token from client storage.' 
+  });
 });
 ```
 
 ---
 
-## 3. Service Mesh Discovery (Istio)
+## Security Considerations
 
-Infrastructure layer handles service discovery automatically.
+### Session-Based Security
+```js
+// Enhanced session security
+app.use(session({
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  name: 'sessionId', // Change default session name
+  cookie: {
+    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
+    httpOnly: true, // Prevent XSS access to cookie
+    maxAge: 30 * 60 * 1000, // 30 minutes
+    sameSite: 'strict' // CSRF protection
+  },
+  genid: () => {
+    return crypto.randomUUID(); // Use crypto-strong session IDs
+  }
+}));
 
-## Summary
+// CSRF protection
+const csrf = require('csurf');
+app.use(csrf());
 
-Service Discovery is essential for microservices architecture, enabling:
+// Session validation middleware
+const validateSession = async (req, res, next) => {
+  if (req.session && req.session.userId) {
+    // Additional validation: check if user still exists
+    const user = await User.findById(req.session.userId);
+    if (!user) {
+      req.session.destroy();
+      return res.status(401).json({ message: 'Invalid session' });
+    }
+    req.user = user;
+    next();
+  } else {
+    res.status(401).json({ message: 'Authentication required' });
+  }
+};
+```
 
-1. **Dynamic Service Location**: Services can find each other without hardcoded addresses
-2. **Load Balancing**: Distribute traffic across multiple service instances
-3. **Fault Tolerance**: Handle service failures gracefully
-4. **Auto-scaling**: Support dynamic scaling of services
-5. **Environment Flexibility**: Easy deployment across different environments
+### JWT Security Best Practices
+```js
+// Enhanced JWT security
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
-Choose the right service discovery pattern based on your architecture:
-- **Client-side**: Simple setup, good for small-medium applications
-- **Server-side**: Better for complex routing, language agnostic
-- **Service Mesh**: Advanced features, suitable for large-scale deployments
+// Secure JWT configuration
+const JWT_CONFIG = {
+  algorithm: 'HS256', // Use strong algorithm
+  expiresIn: '15m',   // Short expiry
+  issuer: 'myapp.com',
+  audience: 'myapp-users'
+};
 
+// Generate secure JWT
+const generateTokens = (user) => {
+  // Access token (short-lived)
+  const accessToken = jwt.sign(
+    { 
+      userId: user._id,
+      username: user.username,
+      role: user.role,
+      type: 'access'
+    },
+    JWT_SECRET,
+    {
+      ...JWT_CONFIG,
+      expiresIn: '15m',
+      jti: crypto.randomUUID() // Unique token ID
+    }
+  );
+  
+  // Refresh token (longer-lived)
+  const refreshToken = jwt.sign(
+    { 
+      userId: user._id,
+      type: 'refresh'
+    },
+    process.env.JWT_REFRESH_SECRET,
+    {
+      ...JWT_CONFIG,
+      expiresIn: '7d',
+      jti: crypto.randomUUID()
+    }
+  );
+  
+  return { accessToken, refreshToken };
+};
 
+// JWT blacklist for logout
+const tokenBlacklist = new Set();
+
+const authenticateJWT = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+  
+  // Check if token is blacklisted
+  if (tokenBlacklist.has(token)) {
+    return res.status(401).json({ message: 'Token revoked' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET, {
+      algorithms: [JWT_CONFIG.algorithm],
+      issuer: JWT_CONFIG.issuer,
+      audience: JWT_CONFIG.audience
+    });
+    
+    if (decoded.type !== 'access') {
+      return res.status(401).json({ message: 'Invalid token type' });
+    }
+    
+    req.user = decoded;
+    req.token = token; // Store for potential blacklisting
+    next();
+  } catch (error) {
+    res.status(403).json({ message: 'Invalid or expired token' });
+  }
+};
+
+// Secure logout with token blacklisting
+app.post('/api/auth/logout', authenticateJWT, (req, res) => {
+  // Add token to blacklist
+  tokenBlacklist.add(req.token);
+  
+  // Clean up expired tokens from blacklist periodically
+  // (implement a cleanup job to remove expired tokens)
+  
+  res.json({ message: 'Logout successful' });
+});
+```
+
+---
+
+## Performance Comparison
+
+### Session-Based Performance
+```js
+// Session performance monitoring
+const monitorSession = (req, res, next) => {
+  const start = Date.now();
+  
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    console.log(`Session lookup took: ${duration}ms`);
+  });
+  
+  next();
+};
+
+// Optimized session store
+const RedisStore = require('connect-redis')(session);
+const redis = require('redis');
+const redisClient = redis.createClient();
+
+app.use(session({
+  store: new RedisStore({ client: redisClient }),
+  // ... other session config
+}));
+```
+
+### JWT Performance
+```js
+// JWT performance monitoring
+const monitorJWT = (req, res, next) => {
+  const start = Date.now();
+  const token = req.headers['authorization']?.split(' ')[1];
+  
+  if (token) {
+    try {
+      jwt.verify(token, JWT_SECRET);
+      const duration = Date.now() - start;
+      console.log(`JWT verification took: ${duration}ms`);
+    } catch (error) {
+      // Handle error
+    }
+  }
+  
+  next();
+};
+
+// JWT with caching for better performance
+const NodeCache = require('node-cache');
+const jwtCache = new NodeCache({ stdTTL: 300 }); // 5 minutes
+
+const authenticateJWTWithCache = (req, res, next) => {
+  const token = req.headers['authorization']?.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ message: 'Access token required' });
+  }
+  
+  // Check cache first
+  const cachedData = jwtCache.get(token);
+  if (cachedData) {
+    req.user = cachedData;
+    return next();
+  }
+  
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    jwtCache.set(token, decoded); // Cache for future requests
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(403).json({ message: 'Invalid token' });
+  }
+};
+```
+
+---
+
+## When to Choose Which?
+
+### Choose Session-Based When:
+- Building traditional server-rendered web applications
+- Working with legacy systems
+- Need server-side state management
+- Security is paramount (server-side storage)
+- Users primarily access from web browsers
+- Simple deployment (single server)
+
+### Choose Token-Based (JWT) When:
+- Building REST APIs or GraphQL APIs
+- Developing Single Page Applications (SPAs)
+- Building mobile applications
+- Need to scale across multiple servers
+- Working with microservices architecture
+- Cross-domain authentication required
+- Building serverless applications
+- Need offline capability
+
+---
+
+## Hybrid Approach
+
+```js
+// Combined approach for maximum flexibility
+class AuthManager {
+  constructor() {
+    this.sessionStore = new Map(); // In production, use Redis
+    this.jwtSecret = process.env.JWT_SECRET;
+  }
+  
+  // Create both session and JWT
+  async createAuth(user, req) {
+    // Create session for web clients
+    req.session.userId = user._id;
+    
+    // Create JWT for API clients
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      this.jwtSecret,
+      { expiresIn: '24h' }
+    );
+    
+    return {
+      sessionId: req.session.id,
+      token,
+      user: { id: user._id, username: user.username }
+    };
+  }
+  
+  // Flexible authentication middleware
+  authenticate(req, res, next) {
+    // Check for JWT first
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, this.jwtSecret);
+        req.user = decoded;
+        req.authType = 'jwt';
+        return next();
+      } catch (error) {
+        // JWT invalid, fall back to session
+      }
+    }
+    
+    // Check session
+    if (req.session && req.session.userId) {
+      req.user = { userId: req.session.userId };
+      req.authType = 'session';
+      return next();
+    }
+    
+    res.status(401).json({ message: 'Authentication required' });
+  }
+}
+
+const authManager = new AuthManager();
+
+// Login endpoint supporting both
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  
+  try {
+    const user = await User.findOne({ username });
+    if (user && await bcrypt.compare(password, user.password)) {
+      const authData = await authManager.createAuth(user, req);
+      res.json(authData);
+    } else {
+      res.status(401).json({ message: 'Invalid credentials' });
+    }
+  } catch (error) {
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Use flexible authentication
+app.get('/api/profile', authManager.authenticate.bind(authManager), (req, res) => {
+  res.json({ 
+    user: req.user,
+    authType: req.authType 
+  });
+});
+```
