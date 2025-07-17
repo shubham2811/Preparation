@@ -688,3 +688,177 @@ console.log(void(console.log("hi")));   // undefined (but "hi" was logged)
 | **Still useful for** | Bookmarklets, IIFE, preventing return values |
 
 **Key Takeaway**: While `void(0)` was crucial for safety in older JavaScript, modern code should prefer `undefined` directly for better readability. However, understanding `void(0)` is important for reading legacy code and specific use cases like bookmarklets.
+
+---
+
+# Understanding WeakMap in JavaScript
+
+## What is WeakMap?
+
+A `WeakMap` is a collection of key-value pairs where **keys must be objects** and the references to keys are **weak**. This means that if there are no other references to a key object, it can be garbage collected even if it's still in the WeakMap.
+
+## Key Characteristics
+
+```js
+// Basic WeakMap creation
+const weakMap = new WeakMap();
+
+// Keys must be objects (not primitives)
+const obj1 = { name: "John" };
+const obj2 = { name: "Jane" };
+const func = function() {};
+
+weakMap.set(obj1, "User data for John");
+weakMap.set(obj2, "User data for Jane");
+weakMap.set(func, "Function metadata");
+
+// This would throw an error - keys must be objects
+// weakMap.set("string", "value"); // TypeError
+// weakMap.set(123, "value");      // TypeError
+```
+
+## WeakMap vs Map Comparison
+
+| Feature | Map | WeakMap |
+|---------|-----|---------|
+| **Key Types** | Any type | Objects only |
+| **Garbage Collection** | Prevents GC | Allows GC |
+| **Enumerable** | Yes (has size, keys(), values()) | No |
+| **Size Property** | Yes | No |
+| **Iteration** | Yes | No |
+| **Clear Method** | Yes | No |
+
+```js
+// Map example
+const map = new Map();
+map.set("key1", "value1");
+map.set(obj1, "value2");
+console.log(map.size); // 2
+for (let [key, value] of map) {
+  console.log(key, value);
+}
+
+// WeakMap example
+const weakMap = new WeakMap();
+weakMap.set(obj1, "value1");
+// console.log(weakMap.size); // undefined - no size property
+// for (let entry of weakMap) {} // TypeError - not iterable
+```
+
+## Primary Use Cases
+
+### 1. **Private Data Storage**
+
+```js
+// Using WeakMap to store private data
+const privateData = new WeakMap();
+
+class User {
+  constructor(name, email) {
+    // Store private data
+    privateData.set(this, {
+      email: email,
+      createdAt: new Date(),
+      sessionToken: Math.random().toString(36)
+    });
+    
+    this.name = name; // Public property
+  }
+  
+  getEmail() {
+    return privateData.get(this).email;
+  }
+  
+  getSessionToken() {
+    return privateData.get(this).sessionToken;
+  }
+  
+  updateEmail(newEmail) {
+    const data = privateData.get(this);
+    data.email = newEmail;
+  }
+}
+
+const user = new User("John", "john@example.com");
+console.log(user.name);           // "John" (accessible)
+console.log(user.email);          // undefined (private)
+console.log(user.getEmail());     // "john@example.com" (via method)
+
+// When user is garbage collected, private data is also cleaned up
+```
+### 2. **Caching and Memoization**
+
+```js
+// Cache expensive computations per object
+const computationCache = new WeakMap();
+
+function expensiveComputation(obj) {
+  // Check if result is already cached
+  if (computationCache.has(obj)) {
+    console.log('Cache hit!');
+    return computationCache.get(obj);
+  }
+  
+  console.log('Computing...');
+  // Simulate expensive operation
+  const result = JSON.stringify(obj).length * Math.random();
+  
+  // Cache the result
+  computationCache.set(obj, result);
+  return result;
+}
+
+const data1 = { name: "John", age: 30 };
+const data2 = { name: "Jane", age: 25 };
+
+console.log(expensiveComputation(data1)); // Computing... then result
+console.log(expensiveComputation(data1)); // Cache hit! then same result
+console.log(expensiveComputation(data2)); // Computing... then result
+```
+## WeakMap Methods
+
+```js
+const wm = new WeakMap();
+const obj = { id: 1 };
+
+// Available methods
+wm.set(obj, "value");           // Add key-value pair
+console.log(wm.get(obj));       // "value" - Get value
+console.log(wm.has(obj));       // true - Check if key exists
+wm.delete(obj);                 // Remove key-value pair
+console.log(wm.has(obj));       // false
+
+// Methods NOT available (unlike Map)
+// wm.size        // undefined
+// wm.clear()     // Method doesn't exist
+// wm.keys()      // Method doesn't exist
+// wm.values()    // Method doesn't exist
+// wm.entries()   // Method doesn't exist
+```
+
+## Best Practices
+
+### 1. **Use WeakMap When**
+- You need to associate data with objects without modifying them
+- You want automatic cleanup when objects are garbage collected
+- You're implementing private data for classes
+- You need object-based caching or memoization
+
+### 2. **Don't Use WeakMap When**
+- You need to iterate over the collection
+- You need to know the size of the collection
+- Keys might be primitive values
+- You need to clear all entries at once
+
+## Summary
+
+| Use Case | Description | Benefit |
+|----------|-------------|---------|
+| **Private Data** | Store private properties for objects | No property pollution |
+| **Metadata** | Add data without modifying objects | Clean separation |
+| **Caching** | Cache results per object | Automatic cleanup |
+| **State Management** | Manage object state externally | Memory efficient |
+| **Event Tracking** | Track events without memory leaks | Garbage collection |
+| **Mixins** | Add functionality to objects | Non-intrusive |
+
+**Key Benefits**: Automatic memory management, no object modification, and clean separation of concerns make WeakMap ideal for scenarios where you need to associate data with objects temporarily or privately.

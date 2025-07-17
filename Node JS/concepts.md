@@ -2327,10 +2327,10 @@ class MemoryLeakDetector {
     const recent = this.samples.slice(-2);
     const oldest = recent[0];
     const newest = recent[1];
-    
-    const growth = newest.heapUsed - oldest.heapUsed;
+    const totalGrowth = newest.memory.heapUsed - oldest.memory.heapUsed;
     const timeSpan = newest.timestamp - oldest.timestamp;
-    const growthPerMinute = (growth / timeSpan) * 60 * 1000;
+    
+    const growthPerMinute = (totalGrowth / timeSpan) * 60 * 1000;
     
     if (growthPerMinute > this.threshold * 1024 * 1024) {
       this.sendAlert('HIGH_GROWTH_RATE', {
@@ -2357,757 +2357,899 @@ if (process.env.NODE_ENV === 'production') {
 
 ---
 
-## 4. Prevention Best Practices
+## 4. Common Memory Leak Causes
 
-### Memory-Safe Patterns
+### Event Listener Leaks
 ```js
-// ✅ Use WeakMap for object associations
-const objectMetadata = new WeakMap();
-
-class DataProcessor {
-  setMetadata(obj, metadata) {
-    objectMetadata.set(obj, metadata);
-    // When obj is garbage collected, metadata is automatically removed
+// ❌ MEMORY LEAK: Event listeners not removed
+class LeakyEventEmitter {
+  constructor() {
+    this.eventEmitter = new EventEmitter();
+    this.users = [];
   }
   
-  getMetadata(obj) {
-    return objectMetadata.get(obj);
+  addUser(user) {
+    this.users.push(user);
+    
+    // This creates a new listener for each user
+    this.eventEmitter.on('userUpdate', (data) => {
+      console.log(`User ${user.id} updated:`, data);
+    });
+  }
+  
+  removeUser(userId) {
+    this.users = this.users.filter(u => u.id !== userId);
+    // ❌ Listener not removed - MEMORY LEAK!
   }
 }
 
-// ✅ Implement proper cleanup interfaces
-class ResourceManager {
+// ✅ FIXED: Proper listener management
+class FixedEventEmitter {
   constructor() {
-    this.resources = new Set();
-    this.cleanupCallbacks = new Set();
+    this.eventEmitter = new EventEmitter();
+    this.users = new Map();
+    this.listeners = new Map();
   }
   
-  addResource(resource) {
-    this.resources.add(resource);
+  addUser(user) {
+    this.users.set(user.id, user);
     
-    // Add cleanup callback if resource supports it
-    if (typeof resource.cleanup === 'function') {
-      this.cleanupCallbacks.add(() => resource.cleanup());
-    }
+    // Store reference to listener function
+    const listener = (data) => {
+      console.log(`User ${user.id} updated:`, data);
+    };
+    
+    this.listeners.set(user.id, listener);
+    this.eventEmitter.on('userUpdate', listener);
   }
   
-  removeResource(resource) {
-    this.resources.delete(resource);
+  removeUser(userId) {
+    this.users.delete(userId);
     
-    // Cleanup immediately
-    if (typeof resource.cleanup === 'function') {
-      resource.cleanup();
+    // ✅ Remove the specific listener
+    const listener = this.listeners.get(userId);
+    if (listener) {
+      this.eventEmitter.removeListener('userUpdate', listener);
+      this.listeners.delete(userId);
     }
   }
   
   cleanup() {
-    // Run all cleanup callbacks
-    this.cleanupCallbacks.forEach(callback => {
-      try {
-        callback();
-      } catch (error) {
-        console.error('Cleanup error:', error);
+    // ✅ Remove all listeners
+    this.eventEmitter.removeAllListeners();
+    this.users.clear();
+    this.listeners.clear();
+  }
+}
+```
+
+### Closure Memory Leaks
+```js
+// ❌ MEMORY LEAK: Closure retains large objects
+const createHandler = (largeData) => {
+  const data = largeData; // Large object retained in closure
+  
+  return {
+    process: () => {
+      // Only uses a small part of data
+      console.log(data.summary);
+    },
+    data: data // ❌ Entire object exposed
+  };
+};
+
+// ✅ FIXED: Extract only needed data
+const createHandler = (largeData) => {
+  const summary = largeData.summary; // Extract only what's needed
+  
+  return {
+    process: () => {
+      console.log(summary);
+    }
+    // ✅ Large object not retained
+  };
+};
+
+// ❌ MEMORY LEAK: Timer in closure
+const setupTimer = (userData) => {
+  return setInterval(() => {
+    // Even if this timer is never cleared,
+    // userData remains in memory
+    if (userData.isActive) {
+      processUser(userData);
+    }
+  }, 1000);
+};
+
+// ✅ FIXED: Weak references and cleanup
+const timers = new Set();
+
+const setupTimer = (userData) => {
+  const timerId = setInterval(() => {
+    if (userData.isActive) {
+      processUser(userData);
+    } else {
+      // ✅ Self-cleanup when inactive
+      clearInterval(timerId);
+      timers.delete(timerId);
+    }
+  }, 1000);
+  
+  timers.add(timerId);
+  return timerId;
+};
+
+// Cleanup function
+const cleanup = () => {
+  timers.forEach(timerId => clearInterval(timerId));
+  timers.clear();
+};
+
+process.on('SIGTERM', cleanup);
+```
+
+### Global Variable Accumulation
+```js
+// ❌ MEMORY LEAK: Growing global cache
+global.userCache = {};
+global.sessionData = {};
+
+const addUser = (user) => {
+  global.userCache[user.id] = user; // ❌ Never cleaned up
+};
+
+// ✅ FIXED: Bounded cache with TTL
+class BoundedCache {
+  constructor(maxSize = 1000, ttl = 5 * 60 * 1000) {
+    this.cache = new Map();
+    this.maxSize = maxSize;
+    this.ttl = ttl;
+    
+    // Cleanup expired entries every minute
+    setInterval(() => this.cleanup(), 60000);
+  }
+  
+  set(key, value) {
+    // Remove oldest entries if at max size
+    if (this.cache.size >= this.maxSize) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+    
+    this.cache.set(key, {
+      value,
+      timestamp: Date.now()
+    });
+  }
+  
+  get(key) {
+    const item = this.cache.get(key);
+    if (!item) return null;
+    
+    // Check if expired
+    if (Date.now() - item.timestamp > this.ttl) {
+      this.cache.delete(key);
+      return null;
+    }
+    
+    return item.value;
+  }
+  
+  cleanup() {
+    const now = Date.now();
+    for (const [key, item] of this.cache) {
+      if (now - item.timestamp > this.ttl) {
+        this.cache.delete(key);
       }
+    }
+  }
+}
+
+const userCache = new BoundedCache(1000, 5 * 60 * 1000);
+```
+
+### Stream and Buffer Leaks
+```js
+const fs = require('fs');
+
+// ❌ MEMORY LEAK: Stream not properly closed
+const processFile = (filename) => {
+  const stream = fs.createReadStream(filename);
+  
+  stream.on('data', (chunk) => {
+    // Process chunk
+  });
+  
+  // ❌ No error handling or cleanup
+};
+
+// ✅ FIXED: Proper stream management
+const processFile = (filename) => {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filename);
+    const chunks = [];
+    
+    stream.on('data', (chunk) => {
+      chunks.push(chunk);
     });
     
-    this.resources.clear();
-    this.cleanupCallbacks.clear();
+    stream.on('end', () => {
+      resolve(Buffer.concat(chunks));
+    });
+    
+    stream.on('error', (error) => {
+      stream.destroy(); // ✅ Cleanup on error
+      reject(error);
+    });
+    
+    // ✅ Timeout protection
+    const timeout = setTimeout(() => {
+      stream.destroy();
+      reject(new Error('Stream timeout'));
+    }, 30000);
+    
+    stream.on('close', () => {
+      clearTimeout(timeout);
+    });
+  });
+};
+
+// ✅ Buffer pool for reuse
+class BufferPool {
+  constructor(bufferSize = 64 * 1024) {
+    this.buffers = [];
+    this.bufferSize = bufferSize;
+  }
+  
+  acquire() {
+    return this.buffers.pop() || Buffer.allocUnsafe(this.bufferSize);
+  }
+  
+  release(buffer) {
+    if (buffer.length === this.bufferSize) {
+      buffer.fill(0); // Clear data
+      this.buffers.push(buffer);
+    }
   }
 }
+
+const bufferPool = new BufferPool();
 ```
 
-### Production Monitoring Setup
+---
+
+## Streams
+
+### What are Streams?
+
+Streams are **abstract interfaces** for working with streaming data. They allow you to process data piece by piece without loading everything into memory.
+
+### Types of Streams
+
+| Stream Type | Purpose | Methods | Example |
+|-------------|---------|---------|---------|
+| **Readable** | Read data from source | `read()`, `pipe()` | File reading, HTTP requests |
+| **Writable** | Write data to destination | `write()`, `end()` | File writing, HTTP responses |
+| **Duplex** | Both readable and writable | Both sets | TCP sockets, crypto streams |
+| **Transform** | Modify data as it passes through | `_transform()` | Compression, encryption |
+
+---
+
+## 1. Readable Streams
+
+### Basic Readable Stream
 ```js
-// production-monitor.js
-const os = require('os');
+const fs = require('fs');
+const { Readable } = require('stream');
 
-class ProductionMemoryMonitor {
-  constructor() {
-    this.alertThresholds = {
-      heapUsed: 1024 * 1024 * 1024, // 1GB
-      rss: 2 * 1024 * 1024 * 1024,  // 2GB
-      growthRate: 10 * 1024 * 1024   // 10MB/minute
-    };
-    
-    this.samples = [];
-    this.alertsSent = new Set();
-  }
-  
-  start() {
-    // Monitor every minute in production
-    setInterval(() => {
-      this.checkMemory();
-    }, 60000);
-    
-    // Initial check
-    this.checkMemory();
-  }
-  
-  checkMemory() {
-    const usage = process.memoryUsage();
-    const timestamp = Date.now();
-    
-    this.samples.push({ timestamp, ...usage });
-    
-    // Keep only last hour of samples
-    const oneHourAgo = timestamp - 60 * 60 * 1000;
-    this.samples = this.samples.filter(s => s.timestamp > oneHourAgo);
-    
-    this.checkThresholds(usage);
-    this.checkGrowthRate();
-  }
-  
-  checkThresholds(usage) {
-    if (usage.heapUsed > this.alertThresholds.heapUsed) {
-      this.sendAlert('HIGH_HEAP_USAGE', {
-        current: Math.round(usage.heapUsed / 1024 / 1024),
-        threshold: Math.round(this.alertThresholds.heapUsed / 1024 / 1024)
-      });
-    }
-    
-    if (usage.rss > this.alertThresholds.rss) {
-      this.sendAlert('HIGH_RSS_USAGE', {
-        current: Math.round(usage.rss / 1024 / 1024),
-        threshold: Math.round(this.alertThresholds.rss / 1024 / 1024)
-      });
-    }
-  }
-  
-  checkGrowthRate() {
-    if (this.samples.length < 10) return;
-    
-    const recent = this.samples.slice(-10);
-    const oldest = recent[0];
-    const newest = recent[recent.length - 1];
-    
-    const growth = newest.heapUsed - oldest.heapUsed;
-    const timeSpan = newest.timestamp - oldest.timestamp;
-    const growthPerMinute = (growth / timeSpan) * 60 * 1000;
-    
-    if (growthPerMinute > this.alertThresholds.growthRate) {
-      this.sendAlert('HIGH_GROWTH_RATE', {
-        rate: Math.round(growthPerMinute / 1024 / 1024),
-        threshold: Math.round(this.alertThresholds.growthRate / 1024 / 1024)
-      });
-    }
-  }
-  
-  sendAlert(type, data) {
-    const alertKey = `${type}_${Math.floor(Date.now() / 300000)}`; // 5min window
-    
-    if (this.alertsSent.has(alertKey)) return;
-    
-    this.alertsSent.add(alertKey);
-    
-    // Send to monitoring service (e.g., Slack, PagerDuty, etc.)
-    console.error(`🚨 MEMORY ALERT [${type}]:`, data);
-    
-    // In production, integrate with your alerting system
-    // this.notificationService.send(type, data);
-  }
-}
-
-// Start monitoring in production
-if (process.env.NODE_ENV === 'production') {
-  const monitor = new ProductionMemoryMonitor();
-  monitor.start();
-}
-```
-
----
-
-## 5. Memory Leak Checklist
-
-### Development Checklist
-- [ ] Remove event listeners when components are destroyed
-- [ ] Clear timers and intervals
-- [ ] Close streams and database connections
-- [ ] Use WeakMap/WeakSet for temporary object associations
-- [ ] Implement cleanup methods in classes
-- [ ] Avoid global variables for temporary data
-- [ ] Use bounded caches with TTL
-- [ ] Handle promise rejections properly
-
-### Testing Checklist
-- [ ] Run memory profiling during load tests
-- [ ] Monitor memory growth over extended periods
-- [ ] Test cleanup functionality
-- [ ] Verify event listener removal
-- [ ] Check for orphaned timers
-- [ ] Test error scenarios for proper cleanup
-
-### Production Checklist
-- [ ] Set up memory monitoring alerts
-- [ ] Configure heap dump generation on high usage
-- [ ] Implement graceful shutdown procedures
-- [ ] Monitor garbage collection frequency
-- [ ] Set up automatic restarts for memory thresholds
-- [ ] Log memory statistics periodically
-
----
-
-## Tools Summary
-
-| Tool | Purpose | Best For | Cost |
-|------|---------|----------|------|
-| **Chrome DevTools** | Heap analysis, snapshots | Development debugging | Free |
-| **clinic.js** | Performance profiling | Development optimization | Free |
-| **heapdump** | Heap snapshot generation | Production debugging | Free |
-| **memwatch-next** | Real-time memory monitoring | Development/Testing | Free |
-| **New Relic** | APM with memory tracking | Production monitoring | Paid |
-| **DataDog** | Infrastructure monitoring | Production monitoring | Paid |
-
-Understanding and preventing memory leaks is crucial for building robust Node.js applications that can handle production loads efficiently.
-
-# Session-Based vs Token-Based Authentication: Detailed Comparison
-
-## Architecture Differences
-
-### Session-Based Authentication Flow
-```
-1. User submits credentials
-2. Server validates credentials
-3. Server creates session in memory/database
-4. Server sends session ID as cookie
-5. Client automatically sends cookie with requests
-6. Server validates session ID and retrieves user data
-```
-
-### Token-Based Authentication Flow
-```
-1. User submits credentials
-2. Server validates credentials
-3. Server creates signed JWT token
-4. Server sends token to client
-5. Client stores token and sends in Authorization header
-6. Server validates token signature and extracts user data
-```
-
----
-
-## Detailed Comparison Table
-
-| Aspect | Session-Based | Token-Based (JWT) |
-|--------|---------------|-------------------|
-| **State Management** | Stateful (server stores session) | Stateless (token contains all data) |
-| **Scalability** | Difficult (session sharing needed) | Easy (no server state) |
-| **Memory Usage** | High (server stores all sessions) | Low (no server storage) |
-| **Network Overhead** | Low (small session ID) | Medium (larger token size) |
-| **Security Storage** | Server-side (more secure) | Client-side (less secure) |
-| **CSRF Protection** | Vulnerable (automatic cookie sending) | Protected (manual token sending) |
-| **XSS Protection** | Better (HTTP-only cookies) | Vulnerable (localStorage accessible) |
-| **Token Expiration** | Server controls | Built into token |
-| **Logout** | Server destroys session | Client discards token |
-| **Cross-Domain** | Limited (same-origin cookies) | Easy (CORS headers) |
-| **Mobile Apps** | Complex cookie handling | Simple header-based |
-| **Microservices** | Requires shared session store | Self-contained validation |
-
----
-
-## Code Examples Comparison
-
-### Session-Based Implementation
-```js
-const express = require('express');
-const session = require('express-session');
-const MongoStore = require('connect-mongo');
-
-const app = express();
-
-// Session configuration
-app.use(session({
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  store: MongoStore.create({
-    mongoUrl: 'mongodb://localhost/sessions'
-  }),
-  cookie: {
-    secure: process.env.NODE_ENV === 'production',
-    httpOnly: true, // Prevent XSS
-    maxAge: 24 * 60 * 60 * 1000 // 24 hours
-  }
-}));
-
-// Login endpoint
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  
-  try {
-    const user = await User.findOne({ username });
-    if (user && await bcrypt.compare(password, user.password)) {
-      // Store user data in session
-      req.session.userId = user._id;
-      req.session.username = user.username;
-      req.session.role = user.role;
-      
-      res.json({ 
-        success: true, 
-        message: 'Login successful',
-        user: { id: user._id, username: user.username }
-      });
-    } else {
-      res.status(401).json({ message: 'Invalid credentials' });
-    }
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
-  }
+// File readable stream
+const fileStream = fs.createReadStream('large-file.txt', {
+  encoding: 'utf8',
+  highWaterMark: 16 * 1024, // 16KB chunks
+  start: 100,               // Start from byte 100
+  end: 500                  // End at byte 500
 });
 
-// Authentication middleware
-const requireAuth = (req, res, next) => {
-  if (req.session && req.session.userId) {
-    // Session exists, user is authenticated
-    req.user = {
-      id: req.session.userId,
-      username: req.session.username,
-      role: req.session.role
-    };
-    next();
-  } else {
-    res.status(401).json({ message: 'Authentication required' });
+fileStream.on('data', (chunk) => {
+  console.log(`Received chunk of size: ${chunk.length}`);
+  console.log(`Chunk content: ${chunk.slice(0, 50)}...`);
+});
+
+fileStream.on('end', () => {
+  console.log('Stream ended');
+});
+
+fileStream.on('error', (error) => {
+  console.error('Stream error:', error);
+});
+```
+
+## 2. Writable Streams
+
+### Basic Writable Stream
+```js
+const fs = require('fs');
+
+const writeStream = fs.createWriteStream('output.txt', {
+  encoding: 'utf8',
+  highWaterMark: 16 * 1024, // 16KB buffer
+  flags: 'w'                // Write mode (overwrite)
+});
+
+// Writing data
+writeStream.write('Hello, ');
+writeStream.write('World!\n');
+
+// End the stream
+writeStream.end('Final line');
+
+writeStream.on('finish', () => {
+  console.log('Write stream finished');
+});
+
+writeStream.on('error', (error) => {
+  console.error('Write error:', error);
+});
+```
+
+
+## 3. Duplex Streams
+
+```js
+const { Duplex } = require('stream');
+const net = require('net');
+
+// TCP socket is a duplex stream
+const server = net.createServer((socket) => {
+  console.log('Client connected');
+  
+  // Socket is both readable and writable
+  socket.write('Welcome to the server!\n');
+  
+  socket.on('data', (data) => {
+    console.log(`Received: ${data}`);
+    socket.write(`Echo: ${data}`);
+  });
+  
+  socket.on('end', () => {
+    console.log('Client disconnected');
+  });
+});
+
+// Custom duplex stream
+class EchoStream extends Duplex {
+  constructor(options = {}) {
+    super(options);
+    this.data = [];
+  }
+  
+  _read() {
+    // Read from internal buffer
+    if (this.data.length > 0) {
+      this.push(this.data.shift());
+    }
+  }
+  
+  _write(chunk, encoding, callback) {
+    // Echo the data back to readable side
+    this.data.push(chunk);
+    callback();
+  }
+}
+
+// Usage
+const echo = new EchoStream();
+
+echo.on('data', (chunk) => {
+  console.log(`Echoed: ${chunk}`);
+});
+
+echo.write('Hello, ');
+echo.write('Duplex Stream!');
+```
+
+---
+
+## 4. Transform Streams
+
+### Basic Transform Stream
+```js
+const { Transform } = require('stream');
+
+class UpperCaseTransform extends Transform {
+  _transform(chunk, encoding, callback) {
+    // Transform the chunk
+    const upperChunk = chunk.toString().toUpperCase();
+    this.push(upperChunk);
+    callback();
+  }
+}
+
+// Usage with pipe
+const fs = require('fs');
+
+fs.createReadStream('input.txt')
+  .pipe(new UpperCaseTransform())
+  .pipe(fs.createWriteStream('output.txt'));
+```
+
+### Advanced Transform Streams
+```js
+// JSON parser transform
+class JSONParseTransform extends Transform {
+  constructor(options = {}) {
+    super({ objectMode: true, ...options });
+    this.buffer = '';
+  }
+  
+  _transform(chunk, encoding, callback) {
+    this.buffer += chunk.toString();
+    
+    // Try to parse complete JSON objects
+    let lines = this.buffer.split('\n');
+    this.buffer = lines.pop(); // Keep incomplete line
+    
+    for (const line of lines) {
+      if (line.trim()) {
+        try {
+          const obj = JSON.parse(line);
+          this.push(obj);
+        } catch (error) {
+          this.emit('error', error);
+        }
+      }
+    }
+    
+    callback();
+  }
+  
+  _flush(callback) {
+    // Process remaining buffer
+    if (this.buffer.trim()) {
+      try {
+        const obj = JSON.parse(this.buffer);
+        this.push(obj);
+      } catch (error) {
+        this.emit('error', error);
+      }
+    }
+    callback();
+  }
+}
+
+// CSV parser transform
+class CSVParseTransform extends Transform {
+  constructor(options = {}) {
+    super({ objectMode: true, ...options });
+    this.headers = null;
+    this.separator = options.separator || ',';
+  }
+  
+  _transform(chunk, encoding, callback) {
+    const lines = chunk.toString().split('\n');
+    
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      
+      const values = line.split(this.separator);
+      
+      if (!this.headers) {
+        this.headers = values;
+      } else {
+        const obj = {};
+        this.headers.forEach((header, index) => {
+          obj[header] = values[index];
+        });
+        this.push(obj);
+      }
+    }
+    
+    callback();
+  }
+}
+
+// Usage
+const csvStream = fs.createReadStream('data.csv')
+  .pipe(new CSVParseTransform())
+  .pipe(new Transform({
+    objectMode: true,
+    transform(obj, encoding, callback) {
+      console.log('Parsed CSV row:', obj);
+      callback();
+    }
+  }));
+```
+
+---
+
+## Stream Piping
+
+### Basic Piping
+```js
+const fs = require('fs');
+const zlib = require('zlib');
+
+// Simple pipe
+fs.createReadStream('input.txt')
+  .pipe(fs.createWriteStream('output.txt'));
+
+// Chained pipes with compression
+fs.createReadStream('large-file.txt')
+  .pipe(zlib.createGzip())                    // Compress
+  .pipe(fs.createWriteStream('output.gz'));   // Write compressed
+
+// Complex pipeline
+fs.createReadStream('data.json')
+  .pipe(new JSONParseTransform())             // Parse JSON
+  .pipe(new Transform({                       // Filter data
+    objectMode: true,
+    transform(obj, encoding, callback) {
+      if (obj.active) {
+        this.push(obj);
+      }
+      callback();
+    }
+  }))
+  .pipe(new Transform({                       // Transform data
+    objectMode: true,
+    transform(obj, encoding, callback) {
+      this.push(JSON.stringify(obj) + '\n');
+      callback();
+    }
+  }))
+  .pipe(fs.createWriteStream('filtered.json'));
+```
+
+### Pipeline with Error Handling
+```js
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+
+const pipelineAsync = promisify(pipeline);
+
+// Async pipeline with proper error handling
+const processFile = async () => {
+  try {
+    await pipelineAsync(
+      fs.createReadStream('input.txt'),
+      new UpperCaseTransform(),
+      zlib.createGzip(),
+      fs.createWriteStream('output.txt.gz')
+    );
+    console.log('Pipeline completed successfully');
+  } catch (error) {
+    console.error('Pipeline error:', error);
   }
 };
 
-// Protected route
-app.get('/api/profile', requireAuth, (req, res) => {
-  res.json({ 
-    message: 'Profile data',
-    user: req.user 
+processFile();
+
+// Manual pipeline with error handling
+const manualPipeline = () => {
+  const readable = fs.createReadStream('input.txt');
+  const transform = new UpperCaseTransform();
+  const writable = fs.createWriteStream('output.txt');
+  
+  // Handle errors on all streams
+  [readable, transform, writable].forEach(stream => {
+    stream.on('error', (error) => {
+      console.error(`${stream.constructor.name} error:`, error);
+      // Cleanup other streams
+      readable.destroy();
+      transform.destroy();
+      writable.destroy();
+    });
   });
+  
+  readable
+    .pipe(transform)
+    .pipe(writable)
+    .on('finish', () => {
+      console.log('Manual pipeline completed');
+    });
+};
+```
+
+---
+
+## Stream Performance and Memory Management
+
+### Memory-Efficient File Processing
+```js
+// ❌ Inefficient: Loading entire file into memory
+const processFileInefficient = async (filename) => {
+  const data = await fs.promises.readFile(filename, 'utf8');
+  const lines = data.split('\n');
+  
+  for (const line of lines) {
+    // Process line
+    await processLine(line);
+  }
+};
+
+// ✅ Efficient: Stream processing
+const processFileEfficient = (filename) => {
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filename, { encoding: 'utf8' });
+    let buffer = '';
+    
+    stream.on('data', async (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      buffer = lines.pop(); // Keep incomplete line
+      
+      for (const line of lines) {
+        await processLine(line);
+      }
+    });
+    
+    stream.on('end', async () => {
+      if (buffer) {
+        await processLine(buffer); // Process last line
+      }
+      resolve();
+    });
+    
+    stream.on('error', reject);
+  });
+};
+
+const processLine = async (line) => {
+  // Simulate processing
+  console.log(`Processing: ${line.slice(0, 50)}...`);
+};
+```
+
+### Stream Monitoring and Metrics
+```js
+class StreamMonitor extends Transform {
+  constructor(options = {}) {
+    super(options);
+    this.bytesProcessed = 0;
+    this.chunksProcessed = 0;
+    this.startTime = Date.now();
+    
+    // Report progress every 1000 chunks
+    this.reportInterval = options.reportInterval || 1000;
+  }
+  
+  _transform(chunk, encoding, callback) {
+    this.bytesProcessed += chunk.length;
+    this.chunksProcessed++;
+    
+    if (this.chunksProcessed % this.reportInterval === 0) {
+      this.reportProgress();
+    }
+    
+    this.push(chunk);
+    callback();
+  }
+  
+  _flush(callback) {
+    this.reportProgress();
+    console.log('Stream processing completed');
+    callback();
+  }
+  
+  reportProgress() {
+    const elapsed = Date.now() - this.startTime;
+    const throughput = this.bytesProcessed / (elapsed / 1000); // bytes/second
+    
+    console.log(`Progress: ${this.chunksProcessed} chunks, ${this.bytesProcessed} bytes`);
+    console.log(`Throughput: ${Math.round(throughput / 1024)} KB/s`);
+  }
+}
+
+// Usage
+fs.createReadStream('large-file.txt')
+  .pipe(new StreamMonitor({ reportInterval: 100 }))
+  .pipe(fs.createWriteStream('output.txt'));
+```
+
+---
+
+## Real-World Examples
+
+### HTTP File Upload with Streams
+```js
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url === '/upload') {
+    const filename = path.join(__dirname, 'uploads', `file-${Date.now()}.bin`);
+    const writeStream = fs.createWriteStream(filename);
+    
+    let uploadedBytes = 0;
+    const contentLength = parseInt(req.headers['content-length']);
+    
+    req.on('data', (chunk) => {
+      uploadedBytes += chunk.length;
+      const progress = (uploadedBytes / contentLength * 100).toFixed(2);
+      console.log(`Upload progress: ${progress}%`);
+    });
+    
+    // Pipe request directly to file
+    req.pipe(writeStream);
+    
+    writeStream.on('finish', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ 
+        message: 'Upload successful',
+        filename,
+        size: uploadedBytes 
+      }));
+    });
+    
+    writeStream.on('error', (error) => {
+      res.writeHead(500);
+      res.end('Upload failed');
+    });
+  } else {
+    res.writeHead(404);
+    res.end('Not found');
+  }
 });
 
-// Logout
-app.post('/api/logout', (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      return res.status(500).json({ message: 'Logout failed' });
-    }
-    res.clearCookie('connect.sid'); // Clear session cookie
-    res.json({ message: 'Logout successful' });
-  });
+server.listen(3000, () => {
+  console.log('Upload server running on port 3000');
 });
 ```
 
-### Token-Based (JWT) Implementation
+### Log Processing with Streams
 ```js
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcrypt');
+const readline = require('readline');
 
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRES_IN = '24h';
-
-// Login endpoint
-app.post('/api/auth/login', async (req, res) => {
-  const { username, password } = req.body;
+class LogAnalyzer {
+  constructor() {
+    this.stats = {
+      totalLines: 0,
+      errorCount: 0,
+      warningCount: 0,
+      ipAddresses: new Set(),
+      statusCodes: new Map()
+    };
+  }
   
-  try {
-    const user = await User.findOne({ username });
-    if (user && await bcrypt.compare(password, user.password)) {
-      // Create JWT token with user data
-      const token = jwt.sign(
-        { 
-          userId: user._id,
-          username: user.username,
-          role: user.role,
-          iat: Math.floor(Date.now() / 1000) // Issued at
-        },
-        JWT_SECRET,
-        { expiresIn: JWT_EXPIRES_IN }
+  async analyzeLogFile(filename) {
+    const fileStream = fs.createReadStream(filename);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity
+    });
+    
+    for await (const line of rl) {
+      this.processLogLine(line);
+    }
+    
+    return this.generateReport();
+  }
+  
+  processLogLine(line) {
+    this.stats.totalLines++;
+    
+    // Parse common log format
+    const match = line.match(/^(\S+) \S+ \S+ \[([^\]]+)\] "(\w+) ([^"]*)" (\d+) (\d+)/);
+    
+    if (match) {
+      const [, ip, timestamp, method, url, status, size] = match;
+      
+      this.stats.ipAddresses.add(ip);
+      
+      const statusCode = parseInt(status);
+      this.stats.statusCodes.set(statusCode, 
+        (this.stats.statusCodes.get(statusCode) || 0) + 1
       );
       
-      res.json({ 
-        success: true,
-        message: 'Login successful',
-        token,
-        user: { id: user._id, username: user.username }
-      });
-    } else {
-      res.status(401).json({ message: 'Invalid credentials' });
-    }
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// JWT Authentication middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-  
-  if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
-  }
-  
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ message: 'Invalid or expired token' });
-    }
-    req.user = user;
-    next();
-  });
-};
-
-// Protected route with JWT
-app.get('/api/auth/profile', authenticateToken, (req, res) => {
-  res.json({ 
-    message: 'Profile data',
-    user: req.user 
-  });
-});
-
-// Token refresh
-app.post('/api/auth/refresh', authenticateToken, (req, res) => {
-  // Generate new token with extended expiry
-  const newToken = jwt.sign(
-    { 
-      userId: req.user.userId,
-      username: req.user.username,
-      role: req.user.role 
-    },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRES_IN }
-  );
-  
-  res.json({ 
-    message: 'Token refreshed',
-    token: newToken 
-  });
-});
-
-// Logout (client-side token removal)
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
-  // With JWT, logout is handled client-side by removing the token
-  // Server can optionally maintain a blacklist of revoked tokens
-  res.json({ 
-    message: 'Logout successful. Remove token from client storage.' 
-  });
-});
-```
-
----
-
-## Security Considerations
-
-### Session-Based Security
-```js
-// Enhanced session security
-app.use(session({
-  secret: process.env.SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  name: 'sessionId', // Change default session name
-  cookie: {
-    secure: process.env.NODE_ENV === 'production', // HTTPS only in production
-    httpOnly: true, // Prevent XSS access to cookie
-    maxAge: 30 * 60 * 1000, // 30 minutes
-    sameSite: 'strict' // CSRF protection
-  },
-  genid: () => {
-    return crypto.randomUUID(); // Use crypto-strong session IDs
-  }
-}));
-
-// CSRF protection
-const csrf = require('csurf');
-app.use(csrf());
-
-// Session validation middleware
-const validateSession = async (req, res, next) => {
-  if (req.session && req.session.userId) {
-    // Additional validation: check if user still exists
-    const user = await User.findById(req.session.userId);
-    if (!user) {
-      req.session.destroy();
-      return res.status(401).json({ message: 'Invalid session' });
-    }
-    req.user = user;
-    next();
-  } else {
-    res.status(401).json({ message: 'Authentication required' });
-  }
-};
-```
-
-### JWT Security Best Practices
-```js
-// Enhanced JWT security
-const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
-
-// Secure JWT configuration
-const JWT_CONFIG = {
-  algorithm: 'HS256', // Use strong algorithm
-  expiresIn: '15m',   // Short expiry
-  issuer: 'myapp.com',
-  audience: 'myapp-users'
-};
-
-// Generate secure JWT
-const generateTokens = (user) => {
-  // Access token (short-lived)
-  const accessToken = jwt.sign(
-    { 
-      userId: user._id,
-      username: user.username,
-      role: user.role,
-      type: 'access'
-    },
-    JWT_SECRET,
-    {
-      ...JWT_CONFIG,
-      expiresIn: '15m',
-      jti: crypto.randomUUID() // Unique token ID
-    }
-  );
-  
-  // Refresh token (longer-lived)
-  const refreshToken = jwt.sign(
-    { 
-      userId: user._id,
-      type: 'refresh'
-    },
-    process.env.JWT_REFRESH_SECRET,
-    {
-      ...JWT_CONFIG,
-      expiresIn: '7d',
-      jti: crypto.randomUUID()
-    }
-  );
-  
-  return { accessToken, refreshToken };
-};
-
-// JWT blacklist for logout
-const tokenBlacklist = new Set();
-
-const authenticateJWT = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
-  }
-  
-  // Check if token is blacklisted
-  if (tokenBlacklist.has(token)) {
-    return res.status(401).json({ message: 'Token revoked' });
-  }
-  
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET, {
-      algorithms: [JWT_CONFIG.algorithm],
-      issuer: JWT_CONFIG.issuer,
-      audience: JWT_CONFIG.audience
-    });
-    
-    if (decoded.type !== 'access') {
-      return res.status(401).json({ message: 'Invalid token type' });
-    }
-    
-    req.user = decoded;
-    req.token = token; // Store for potential blacklisting
-    next();
-  } catch (error) {
-    res.status(403).json({ message: 'Invalid or expired token' });
-  }
-};
-
-// Secure logout with token blacklisting
-app.post('/api/auth/logout', authenticateJWT, (req, res) => {
-  // Add token to blacklist
-  tokenBlacklist.add(req.token);
-  
-  // Clean up expired tokens from blacklist periodically
-  // (implement a cleanup job to remove expired tokens)
-  
-  res.json({ message: 'Logout successful' });
-});
-```
-
----
-
-## Performance Comparison
-
-### Session-Based Performance
-```js
-// Session performance monitoring
-const monitorSession = (req, res, next) => {
-  const start = Date.now();
-  
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`Session lookup took: ${duration}ms`);
-  });
-  
-  next();
-};
-
-// Optimized session store
-const RedisStore = require('connect-redis')(session);
-const redis = require('redis');
-const redisClient = redis.createClient();
-
-app.use(session({
-  store: new RedisStore({ client: redisClient }),
-  // ... other session config
-}));
-```
-
-### JWT Performance
-```js
-// JWT performance monitoring
-const monitorJWT = (req, res, next) => {
-  const start = Date.now();
-  const token = req.headers['authorization']?.split(' ')[1];
-  
-  if (token) {
-    try {
-      jwt.verify(token, JWT_SECRET);
-      const duration = Date.now() - start;
-      console.log(`JWT verification took: ${duration}ms`);
-    } catch (error) {
-      // Handle error
-    }
-  }
-  
-  next();
-};
-
-// JWT with caching for better performance
-const NodeCache = require('node-cache');
-const jwtCache = new NodeCache({ stdTTL: 300 }); // 5 minutes
-
-const authenticateJWTWithCache = (req, res, next) => {
-  const token = req.headers['authorization']?.split(' ')[1];
-  
-  if (!token) {
-    return res.status(401).json({ message: 'Access token required' });
-  }
-  
-  // Check cache first
-  const cachedData = jwtCache.get(token);
-  if (cachedData) {
-    req.user = cachedData;
-    return next();
-  }
-  
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    jwtCache.set(token, decoded); // Cache for future requests
-    req.user = decoded;
-    next();
-  } catch (error) {
-    res.status(403).json({ message: 'Invalid token' });
-  }
-};
-```
-
----
-
-## When to Choose Which?
-
-### Choose Session-Based When:
-- Building traditional server-rendered web applications
-- Working with legacy systems
-- Need server-side state management
-- Security is paramount (server-side storage)
-- Users primarily access from web browsers
-- Simple deployment (single server)
-
-### Choose Token-Based (JWT) When:
-- Building REST APIs or GraphQL APIs
-- Developing Single Page Applications (SPAs)
-- Building mobile applications
-- Need to scale across multiple servers
-- Working with microservices architecture
-- Cross-domain authentication required
-- Building serverless applications
-- Need offline capability
-
----
-
-## Hybrid Approach
-
-```js
-// Combined approach for maximum flexibility
-class AuthManager {
-  constructor() {
-    this.sessionStore = new Map(); // In production, use Redis
-    this.jwtSecret = process.env.JWT_SECRET;
-  }
-  
-  // Create both session and JWT
-  async createAuth(user, req) {
-    // Create session for web clients
-    req.session.userId = user._id;
-    
-    // Create JWT for API clients
-    const token = jwt.sign(
-      { userId: user._id, username: user.username },
-      this.jwtSecret,
-      { expiresIn: '24h' }
-    );
-    
-    return {
-      sessionId: req.session.id,
-      token,
-      user: { id: user._id, username: user.username }
-    };
-  }
-  
-  // Flexible authentication middleware
-  authenticate(req, res, next) {
-    // Check for JWT first
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    
-    if (token) {
-      try {
-        const decoded = jwt.verify(token, this.jwtSecret);
-        req.user = decoded;
-        req.authType = 'jwt';
-        return next();
-      } catch (error) {
-        // JWT invalid, fall back to session
+      if (statusCode >= 400) {
+        this.stats.errorCount++;
       }
     }
     
-    // Check session
-    if (req.session && req.session.userId) {
-      req.user = { userId: req.session.userId };
-      req.authType = 'session';
-      return next();
+    if (line.includes('WARN')) {
+      this.stats.warningCount++;
     }
-    
-    res.status(401).json({ message: 'Authentication required' });
+  }
+  
+  generateReport() {
+    return {
+      totalLines: this.stats.totalLines,
+      uniqueIPs: this.stats.ipAddresses.size,
+      errors: this.stats.errorCount,
+      warnings: this.stats.warningCount,
+      topStatusCodes: Array.from(this.stats.statusCodes.entries())
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+    };
   }
 }
 
-const authManager = new AuthManager();
+// Usage
+const analyzer = new LogAnalyzer();
+analyzer.analyzeLogFile('access.log')
+  .then(report => console.log('Log analysis report:', report))
+  .catch(error => console.error('Analysis failed:', error));
+```
 
-// Login endpoint supporting both
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  
-  try {
-    const user = await User.findOne({ username });
-    if (user && await bcrypt.compare(password, user.password)) {
-      const authData = await authManager.createAuth(user, req);
-      res.json(authData);
+---
+
+## Best Practices
+
+### 1. Error Handling
+```js
+// ✅ Always handle errors
+stream.on('error', (error) => {
+  console.error('Stream error:', error);
+  // Cleanup resources
+});
+
+// ✅ Use pipeline for automatic error propagation
+const { pipeline } = require('stream');
+
+pipeline(
+  source,
+  transform,
+  destination,
+  (error) => {
+    if (error) {
+      console.error('Pipeline failed:', error);
     } else {
-      res.status(401).json({ message: 'Invalid credentials' });
+      console.log('Pipeline succeeded');
     }
-  } catch (error) {
-    res.status(500).json({ message: 'Server error' });
+  }
+);
+```
+
+### 2. Memory Management
+```js
+// ✅ Use appropriate highWaterMark
+const stream = fs.createReadStream('file.txt', {
+  highWaterMark: 64 * 1024 // 64KB chunks instead of default 16KB
+});
+
+// ✅ Destroy streams when done
+const cleanup = () => {
+  if (stream && !stream.destroyed) {
+    stream.destroy();
+  }
+};
+
+process.on('SIGINT', cleanup);
+process.on('SIGTERM', cleanup);
+```
+
+### 3. Performance Optimization
+```js
+// ✅ Use object mode for structured data
+const transform = new Transform({
+  objectMode: true,
+  transform(obj, encoding, callback) {
+    // Process objects instead of buffers
+    this.push(processObject(obj));
+    callback();
   }
 });
 
-// Use flexible authentication
-app.get('/api/profile', authManager.authenticate.bind(authManager), (req, res) => {
-  res.json({ 
-    user: req.user,
-    authType: req.authType 
-  });
-});
+// ✅ Implement _writev for batch operations
+class BatchWriter extends Writable {
+  _writev(chunks, callback) {
+    // Process multiple chunks at once
+    const data = chunks.map(({ chunk }) => chunk);
+    this.processBatch(data);
+    callback();
+  }
+}
 ```
+
+## Summary
+
+**Buffers** are fixed-size memory allocations for binary data, while **Streams** provide an interface for processing data incrementally. Together, they enable efficient handling of large datasets and I/O operations in Node.js applications.
+
+**Key Benefits:**
+- **Memory efficiency**: Process large files without loading everything into memory
+- **Better performance**: Start processing data before it's fully available
+- **Composability**: Chain operations using pipes
+- **Real-time processing**: Handle data as it arrives
+
+Understanding Streams and Buffers is essential for building scalable Node.js applications that handle large amounts of data efficiently.

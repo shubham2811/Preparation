@@ -754,3 +754,120 @@ $$;
 - Need for database portability
 - Team lacks database expertise
 - Microservices architecture with database per service
+
+## Lateral Joins
+
+### What is a Lateral Join?
+
+**Definition**: A lateral join is a special type of join that allows a subquery in the FROM clause to reference columns from tables that appear earlier in the same FROM clause. Unlike regular subqueries, lateral joins can access outer query values for each row.
+
+**Key Concept**: The word "lateral" means the subquery can look "sideways" at other tables in the same query level.
+
+```sql
+-- Basic lateral join syntax (PostgreSQL)
+SELECT *
+FROM table1 t1
+CROSS JOIN LATERAL (
+    SELECT *
+    FROM table2 t2
+    WHERE t2.foreign_key = t1.primary_key
+    LIMIT 3
+) lateral_subquery;
+```
+
+### Syntax Variations by Database
+
+#### PostgreSQL
+```sql
+-- CROSS JOIN LATERAL
+SELECT * FROM table1 t1
+CROSS JOIN LATERAL (
+    SELECT * FROM table2 t2 WHERE t2.id = t1.id
+) sub;
+
+-- LEFT JOIN LATERAL
+SELECT * FROM table1 t1
+LEFT JOIN LATERAL (
+    SELECT * FROM table2 t2 WHERE t2.id = t1.id LIMIT 1
+) sub ON true;
+```
+
+### Regular Join vs Lateral Join
+
+#### Regular Join Limitation
+```sql
+-- This DOESN'T work - subquery can't reference outer table
+SELECT c.customer_name, recent_orders.order_date
+FROM customers c
+JOIN (
+    SELECT customer_id, order_date, total_amount
+    FROM orders o
+    WHERE o.customer_id = c.customer_id  -- ERROR: can't reference 'c'
+    ORDER BY order_date DESC
+    LIMIT 3
+) recent_orders ON c.customer_id = recent_orders.customer_id;
+```
+
+#### Lateral Join Solution
+```sql
+-- This WORKS - lateral can reference outer table
+SELECT c.customer_name, recent_orders.order_date, recent_orders.total_amount
+FROM customers c
+CROSS JOIN LATERAL (
+    SELECT order_date, total_amount
+    FROM orders o
+    WHERE o.customer_id = c.customer_id  -- Can reference 'c'!
+    ORDER BY order_date DESC
+    LIMIT 3
+) recent_orders;
+```
+
+### Common Use Cases
+
+#### 1. Top N per Group
+Get the top 3 most recent orders for each customer:
+
+```sql
+-- PostgreSQL
+SELECT 
+    c.customer_id,
+    c.customer_name,
+    recent.order_id,
+    recent.order_date,
+    recent.total_amount
+FROM customers c
+LEFT JOIN LATERAL (
+    SELECT order_id, order_date, total_amount
+    FROM orders o
+    WHERE o.customer_id = c.customer_id
+    ORDER BY order_date DESC
+    LIMIT 3
+) recent ON true
+ORDER BY c.customer_id, recent.order_date DESC;
+```
+
+### Best Practices
+
+1. **Use Appropriate Indexes**: Ensure join columns and ORDER BY columns are indexed
+2. **Limit Results**: Use LIMIT/TOP to avoid large result sets
+3. **Consider Alternatives**: Sometimes window functions or CTEs are more efficient
+4. **Test Performance**: Compare execution plans with alternative approaches
+5. **Use LEFT JOIN LATERAL**: When you want to include rows even if lateral subquery returns no results
+6. **Avoid Complex Nesting**: Keep lateral subqueries as simple as possible
+7. **Database Compatibility**: Know the syntax for your specific database system
+
+### Common Pitfalls
+
+1. **Missing ON TRUE**: In PostgreSQL, LEFT JOIN LATERAL requires ON condition
+2. **Performance Issues**: Lateral joins can be slow without proper indexes
+3. **Null Handling**: Be careful with NULL values in lateral subqueries
+4. **Syntax Confusion**: Different databases use different keywords (LATERAL vs APPLY)
+
+### Database Support
+
+| Database | Syntax | Notes |
+|----------|--------|-------|
+| **PostgreSQL** | `LATERAL` | Full support, most flexible |
+| **SQL Server** | `CROSS/OUTER APPLY` | Equivalent functionality |
+
+
